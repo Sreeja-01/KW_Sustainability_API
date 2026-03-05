@@ -1,18 +1,10 @@
 """
 Document API routes
-
-Handles:
-- Upload sustainability reports (PDF / Excel)
-- Parse files
-- Extract ESG metrics with LLM
-- Store results in database
-- List documents with pagination
-- Get document details
 """
 
 import os
-import logging
 import uuid
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -20,12 +12,13 @@ from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_user
-from app.models.document import Document
 from app.models.user import User
+from app.models.document import Document
 from app.models.carbon import CarbonMetric
 from app.models.energy import EnergyMetric
 from app.models.water import WaterMetric
 from app.models.waste import WasteMetric
+
 from app.services.file_parser import parse_file
 from app.services.llm_extractor import get_extractor
 from app.core.config import settings
@@ -38,9 +31,9 @@ UPLOAD_DIR = settings.UPLOAD_DIR
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
-# ---------------------------------------------------------
+# ---------------------------------------------------
 # Upload Document
-# ---------------------------------------------------------
+# ---------------------------------------------------
 
 @router.post("/upload", status_code=201)
 async def upload_document(
@@ -68,63 +61,62 @@ async def upload_document(
         if len(contents) > settings.MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=400,
-                detail="File too large. Max allowed size is 50MB",
-            )
-
-        existing_doc = (
-            db.query(Document)
-            .filter(Document.user_id == current_user.id)
-            .filter(Document.filename == file.filename)
-            .filter(Document.file_size == len(contents))
-            .first()
-        )
-
-        if existing_doc:
-            raise HTTPException(
-                status_code=409,
-                detail="This document has already been uploaded",
+                detail="File exceeds maximum allowed size",
             )
 
         unique_filename = f"{uuid.uuid4()}_{file.filename}"
+
         file_path = os.path.join(UPLOAD_DIR, unique_filename)
 
-        with open(file_path, "wb") as buffer:
-            buffer.write(contents)
+        with open(file_path, "wb") as f:
+            f.write(contents)
 
-        logger.info(f"File uploaded: {unique_filename}")
+        logger.info(f"File uploaded {unique_filename}")
 
-        try:
-            text = parse_file(file_path)
-        except Exception as e:
-            logger.error(f"File parsing failed: {e}")
-            raise HTTPException(status_code=400, detail="File parsing failed")
+        # -------------------------------
+        # Parse document text
+        # -------------------------------
 
-        if not text or len(text.strip()) == 0:
+        text = parse_file(file_path)
+        from app.services.vector_store import add_document
+
+        add_document(text, {"filename": file.filename})
+
+        if not text:
             raise HTTPException(
                 status_code=400,
-                detail="Could not extract text from document",
+                detail="Unable to extract text from file",
             )
+
+        # -------------------------------
+        # ESG extraction
+        # -------------------------------
 
         extractor = get_extractor()
 
-        try:
-            metrics = extractor.extract_metrics(text)
-        except Exception as e:
-            logger.error(f"LLM extraction failed: {e}")
-            metrics = None
+        metrics = extractor(text) or {}
 
-        company_name = "Unknown"
-        reporting_year: Optional[int] = None
+        # -------------------------------
+        # Safe values
+        # -------------------------------
 
-        if metrics:
-            company_name = metrics.company_name or "Unknown"
-            reporting_year = metrics.reporting_year
+        company_name = metrics.get("company_name", "Unknown")
+        reporting_year: Optional[int] = metrics.get("reporting_year")
+
+        carbon = metrics.get("carbon", {})
+        energy = metrics.get("energy", {})
+        water = metrics.get("water", {})
+        waste = metrics.get("waste", {})
+
+        # -------------------------------
+        # Save document
+        # -------------------------------
 
         document = Document(
-            filename=unique_filename,  # store actual saved filename
+            filename=unique_filename,
             company_name=company_name,
             reporting_year=reporting_year,
-            status="processed" if metrics else "pending",
+            status="processed",
             user_id=current_user.id,
             file_path=file_path,
             file_size=len(contents),
@@ -136,89 +128,67 @@ async def upload_document(
         db.commit()
         db.refresh(document)
 
-        if metrics:
+        # -------------------------------
+        # Save carbon metrics
+        # -------------------------------
 
-            for scope_name, payload in (metrics.carbon_metrics or {}).items():
+        for scope, value in carbon.items():
 
-                value = None
-                unit = None
-
-                if isinstance(payload, dict):
-                    value = payload.get("value")
-                    unit = payload.get("unit")
-                else:
-                    value = payload
-
-                db.add(
-                    CarbonMetric(
-                        document_id=document.id,
-                        scope=scope_name,
-                        value=value,
-                        unit=unit or "tCO2e",
-                    )
+            db.add(
+                CarbonMetric(
+                    document_id=document.id,
+                    scope=scope,
+                    value=value,
+                    unit="tCO2e",
                 )
+            )
 
-            for metric_name, payload in (metrics.energy_metrics or {}).items():
+        # -------------------------------
+        # Save energy metrics
+        # -------------------------------
 
-                value = None
-                unit = None
+        for name, value in energy.items():
 
-                if isinstance(payload, dict):
-                    value = payload.get("value")
-                    unit = payload.get("unit")
-                else:
-                    value = payload
-
-                db.add(
-                    EnergyMetric(
-                        document_id=document.id,
-                        metric_name=metric_name,
-                        value=value,
-                        unit=unit,
-                    )
+            db.add(
+                EnergyMetric(
+                    document_id=document.id,
+                    metric_name=name,
+                    value=value,
+                    unit=None,
                 )
+            )
 
-            for metric_name, payload in (metrics.water_metrics or {}).items():
+        # -------------------------------
+        # Save water metrics
+        # -------------------------------
 
-                value = None
-                unit = None
+        for name, value in water.items():
 
-                if isinstance(payload, dict):
-                    value = payload.get("value")
-                    unit = payload.get("unit")
-                else:
-                    value = payload
-
-                db.add(
-                    WaterMetric(
-                        document_id=document.id,
-                        metric_name=metric_name,
-                        value=value,
-                        unit=unit,
-                    )
+            db.add(
+                WaterMetric(
+                    document_id=document.id,
+                    metric_name=name,
+                    value=value,
+                    unit="m3",
                 )
+            )
 
-            for metric_name, payload in (metrics.waste_metrics or {}).items():
+        # -------------------------------
+        # Save waste metrics
+        # -------------------------------
 
-                value = None
-                unit = None
+        for name, value in waste.items():
 
-                if isinstance(payload, dict):
-                    value = payload.get("value")
-                    unit = payload.get("unit")
-                else:
-                    value = payload
-
-                db.add(
-                    WasteMetric(
-                        document_id=document.id,
-                        metric_name=metric_name,
-                        value=value,
-                        unit=unit,
-                    )
+            db.add(
+                WasteMetric(
+                    document_id=document.id,
+                    metric_name=name,
+                    value=value,
+                    unit=None,
                 )
+            )
 
-            db.commit()
+        db.commit()
 
         return {
             "id": document.id,
@@ -232,16 +202,18 @@ async def upload_document(
         raise
 
     except Exception as e:
-        logger.exception(f"Upload error: {e}")
+
+        logger.exception("Upload failed")
+
         raise HTTPException(
             status_code=500,
             detail="Document processing failed",
         )
 
 
-# ---------------------------------------------------------
-# List Documents (Improved Pagination)
-# ---------------------------------------------------------
+# ---------------------------------------------------
+# List Documents
+# ---------------------------------------------------
 
 @router.get("/documents")
 def list_documents(
@@ -255,25 +227,30 @@ def list_documents(
     query = db.query(Document).filter(Document.user_id == current_user.id)
 
     if company_name:
-        query = query.filter(Document.company_name.ilike(f"%{company_name}%"))
+        query = query.filter(
+            Document.company_name.ilike(f"%{company_name}%")
+        )
 
     total = query.count()
 
-    documents = query.offset(skip).limit(limit).all()
+    docs = query.offset(skip).limit(limit).all()
 
     page = (skip // limit) + 1
 
-    data = [
-        {
-            "id": doc.id,
-            "filename": doc.filename,
-            "company_name": doc.company_name,
-            "reporting_year": doc.reporting_year,
-            "status": doc.status,
-            "created_at": doc.created_at,
-        }
-        for doc in documents
-    ]
+    data = []
+
+    for doc in docs:
+
+        data.append(
+            {
+                "id": doc.id,
+                "filename": doc.filename,
+                "company_name": doc.company_name,
+                "reporting_year": doc.reporting_year,
+                "status": doc.status,
+                "created_at": doc.created_at,
+            }
+        )
 
     return {
         "total": total,
@@ -284,9 +261,9 @@ def list_documents(
     }
 
 
-# ---------------------------------------------------------
-# Get Document Detail
-# ---------------------------------------------------------
+# ---------------------------------------------------
+# Document Detail
+# ---------------------------------------------------
 
 @router.get("/documents/{document_id}")
 def get_document(
@@ -305,26 +282,6 @@ def get_document(
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    carbon_metrics = [
-        {"scope": m.scope, "value": m.value, "unit": m.unit}
-        for m in document.carbon_metrics
-    ]
-
-    energy_metrics = [
-        {"metric_name": m.metric_name, "value": m.value, "unit": m.unit}
-        for m in document.energy_metrics
-    ]
-
-    water_metrics = [
-        {"metric_name": m.metric_name, "value": m.value, "unit": m.unit}
-        for m in document.water_metrics
-    ]
-
-    waste_metrics = [
-        {"metric_name": m.metric_name, "value": m.value, "unit": m.unit}
-        for m in document.waste_metrics
-    ]
-
     return {
         "id": document.id,
         "filename": document.filename,
@@ -337,8 +294,20 @@ def get_document(
         "processed_at": document.processed_at,
         "created_at": document.created_at,
         "updated_at": document.updated_at,
-        "carbon_metrics": carbon_metrics,
-        "energy_metrics": energy_metrics,
-        "water_metrics": water_metrics,
-        "waste_metrics": waste_metrics,
+        "carbon_metrics": [
+            {"scope": m.scope, "value": m.value, "unit": m.unit}
+            for m in document.carbon_metrics
+        ],
+        "energy_metrics": [
+            {"metric_name": m.metric_name, "value": m.value, "unit": m.unit}
+            for m in document.energy_metrics
+        ],
+        "water_metrics": [
+            {"metric_name": m.metric_name, "value": m.value, "unit": m.unit}
+            for m in document.water_metrics
+        ],
+        "waste_metrics": [
+            {"metric_name": m.metric_name, "value": m.value, "unit": m.unit}
+            for m in document.waste_metrics
+        ],
     }

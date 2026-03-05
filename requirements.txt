@@ -27,3 +27,4 @@ groq==0.30.0
 # Testing
 httpx==0.28.1
 pytest==8.3.2
+pymupdf==1.24.10

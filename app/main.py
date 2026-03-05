@@ -1,12 +1,10 @@
 """
-Main FastAPI application.
+Main FastAPI application
 """
 
 import logging
-import os
 from dotenv import load_dotenv
 
-# Load .env variables
 load_dotenv()
 
 from fastapi import FastAPI
@@ -14,40 +12,41 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 
-# Import database
+# Database
 from app.db.session import engine, Base
 from app.db import base
 
-# Import API routers
+# Routes
 from app.api.v1 import routes_auth
 from app.api.v1 import routes_documents
 from app.api.v1 import routes_insights
+from app.api.v1 import routes_search
 
 
-# --------------------------------------------------
+# ---------------------------------------------------
 # Logging
-# --------------------------------------------------
+# ---------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------
+# ---------------------------------------------------
 # FastAPI App
-# --------------------------------------------------
+# ---------------------------------------------------
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="1.0.0",
     description="KW Sustainability Backend API",
+    version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
 
-# --------------------------------------------------
-# CORS Middleware
-# --------------------------------------------------
+# ---------------------------------------------------
+# CORS
+# ---------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,9 +57,9 @@ app.add_middleware(
 )
 
 
-# --------------------------------------------------
-# Include API Routers
-# --------------------------------------------------
+# ---------------------------------------------------
+# API ROUTERS
+# ---------------------------------------------------
 
 app.include_router(
     routes_auth.router,
@@ -80,39 +79,54 @@ app.include_router(
     tags=["insights"],
 )
 
+app.include_router(
+    routes_search.router,
+    prefix=settings.API_V1_STR,
+    tags=["search"],
+)
 
-# --------------------------------------------------
-# Root Endpoint
-# --------------------------------------------------
+
+# ---------------------------------------------------
+# ROOT
+# ---------------------------------------------------
 
 @app.get("/")
 def root():
     return {
         "message": "KW Sustainability API",
-        "status": "running",
+        "status": "running"
     }
 
 
-# --------------------------------------------------
-# Startup Event
-# --------------------------------------------------
+# ---------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
+
+
+# ---------------------------------------------------
+# STARTUP EVENT
+# ---------------------------------------------------
 
 @app.on_event("startup")
 def startup():
-    """
-    Create database tables on startup
-    """
 
     Base.metadata.create_all(bind=engine)
 
     logger.info("Database tables initialized")
 
 
-# --------------------------------------------------
-# Local Run
-# --------------------------------------------------
+# ---------------------------------------------------
+# LOCAL RUN
+# ---------------------------------------------------
 
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
